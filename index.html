@@ -485,7 +485,7 @@ function mailPreview(opt) {
         if (opt.before) await opt.before();
         await sendMail({ to, subject: $('#mp-sub').value, body: $('#mp-body').value, ...(opt.extra ? opt.extra() : {}) }, opt.after ? opt.after(to) : null, { sendId, require: opt.require ? opt.require() : null });
       } catch (e) {
-        if (/すでに送っていました/.test(e.message)) { closeModal(); render(); toast(e.message); return; }
+        if (/すでに送っていました|メールなしで承り済み」にしていました/.test(e.message)) { closeModal(); render(); toast(e.message); return; }
         const known = /CONFLICT|ほかの人|宛先|確認がそろって|内容が変わ|送信中|送信済み/.test(e.message);
         toast(known ? '送信しませんでした：' + e.message : '送れたかどうか確認できませんでした。この画面のまま、もう一度「この内容で送信する」を押してください（送れていた場合は送り直しません）');
         const b = $('#mp-send'); if (b) { b.disabled = false; b.textContent = 'この内容で送信する'; } return;
@@ -509,7 +509,8 @@ async function startShop(eventId, importerId, fromStaff) {
   if (!e) { $('#app').innerHTML = '<div class="wrap"><div class="empty" style="margin-top:20vh">注文ページが見つかりません</div></div>'; return; }
   SHOP = { clientId: uid('c'), eventId, importer: importerId && e.importerIds.includes(importerId) ? importerId : e.importerIds[0], customerId: '', newName: '', newEmail: '', note: '', cart: {}, step: 'items', q: '', fromStaff: !!fromStaff, no: null };
   // 入力途中の内容・送信中の注文は、この端末に残す（タブを閉じたり、QRを読み直したりしても戻る。送り直しても二重にならない）
-  if (!fromStaff) { try { const pd = JSON.parse(lsGet('zen-pending') || ssGet('zen-pending') || 'null'); if (pd && pd.shop && pd.shop.eventId === eventId && Date.now() - pd.at < 864e5 && pd.shop.clientId) { SHOP = { ...pd.shop, fromStaff: false, no: null, step: pd.sent ? 'confirm' : (pd.shop.step === 'confirm' ? 'confirm' : 'items') }; { const okIds = new Set(shopProducts(e).map(p => p.id)); Object.keys(SHOP.cart || {}).forEach(id => { if (!okIds.has(id)) delete SHOP.cart[id]; }); }
+  if (!fromStaff) { try { const pd = JSON.parse(lsGet('zen-pending') || ssGet('zen-pending') || 'null'); if (pd && pd.shop && pd.shop.eventId === eventId && Date.now() - pd.at < 864e5 && pd.shop.clientId) { SHOP = { ...pd.shop, fromStaff: false, no: null, step: pd.sent ? 'confirm' : (pd.shop.step === 'confirm' ? 'confirm' : 'items') }; let removed = 0; { const okIds = new Set(shopProducts(e).map(p => p.id)); Object.keys(SHOP.cart || {}).forEach(id => { if (!okIds.has(id)) { if (SHOP.cart[id] > 0) removed++; delete SHOP.cart[id]; } }); }
+    if (removed) { SHOP.step = 'items'; setTimeout(() => toast('売り切れになった商品を外しました。内容を確かめてから、もう一度「確認へ」を押してください'), 300); } else
     if (pd.sent) setTimeout(() => toast('前回の注文が送れたか確認できていなかったので、内容を戻しました。もう一度「この内容で注文する」を押してください（二重には登録されません）'), 300);
     else if (Object.values(SHOP.cart || {}).some(q => q > 0) || SHOP.customerId || SHOP.newName) setTimeout(() => toast('入力の途中の内容を戻しました'), 300); } } catch (_) {} }
   renderShop();
@@ -642,6 +643,7 @@ function bindShop() {
         if (lastErr) throw lastErr; SHOP.no = j.no; }
       ssDel('zen-pending'); if (!SHOP.fromStaff) lsDel('zen-pending'); SHOP.step = 'done'; renderShop(); scrollTo(0, 0);
     } catch (e) {
+      if (e.data && e.data.no && /前の注文/.test(e.message || '')) { if (!SHOP.fromStaff) lsDel('zen-pending'); SHOP.no = e.data.no; SHOP.step = 'done'; renderShop(); scrollTo(0, 0); toast(e.message); return; }
       if (e.data && e.data.soldOut) { const id = e.data.soldOut; const p = prod(id); delete SHOP.cart[id]; if (p) p.active = false; SHOP.step = 'confirm'; saveDraft(true); renderShop(); scrollTo(0, 0); toast(`${e.message}。注文から外したので、内容を確かめてもう一度「この内容で注文する」を押してください`); return; }
       toast(/売り切れ|本数|店名|連絡先|メール|電話|商品|受付|お店|前の注文/.test(e.message) ? e.message : '送信できませんでした。もう一度「注文する」を押してください（二重には登録されません）'); btn.disabled = false; btn.textContent = 'この内容で注文する'; }
   };
@@ -802,8 +804,9 @@ function sameShopNote(o, pr) {
   const others = DB.orders.filter(x => x.id !== o.id && x.eventId === o.eventId && x.status !== 'cancel' && key(x) === key(o));
   if (!others.length) return '';
   const cnt = others.reduce((a, x) => a + orderPriced(x).count, 0) + pr.count;
+  const kc = others.reduce((a, x) => a + orderPriced(x).kakeCount, 0) + pr.kakeCount; // 掛け率の判定に使う本数（サービスは除く）
   const th = +S().rate.threshold;
-  return `<div class="small" style="background:var(--warnSoft);color:var(--warn);border-radius:6px;padding:6px 9px">⚠ このお店の注文がほかにもあります（${others.map(x => `No.${x.no}・${orderPriced(x).count}本`).join('、')}）。合わせると${cnt}本です。掛け率は注文ごとに計算しています${pr.count < th && cnt >= th ? `。まとめて${S().rate.over}掛けにする場合は、片方の「内容を直す」で本数をまとめてから、もう片方を「取消」してください` : ''}。</div>`;
+  return `<div class="small" style="background:var(--warnSoft);color:var(--warn);border-radius:6px;padding:6px 9px">⚠ このお店の注文がほかにもあります（${others.map(x => `No.${x.no}・${orderPriced(x).count}本`).join('、')}）。合わせると${cnt}本${kc !== cnt ? `（サービスを除くと${kc}本）` : ''}です。掛け率は注文ごとに計算しています${pr.kakeCount < th && kc >= th ? `。まとめて${S().rate.over}掛けにする場合は、片方の「内容を直す」で本数をまとめてから、もう片方を「取消」してください` : ''}。</div>`;
 }
 function orderCard(o) {
   const pr = orderPriced(o); const e = evt(o.eventId); const st = o.status === 'delivered' && !o.deliveryId ? ['お届け済み', 'p-ok'] : (OST[o.status] || OST.new);
@@ -862,7 +865,7 @@ function mailOrder(o) {
     after: to => ({ col: 'orders', item: { ...o, status: 'mailed', priced: { rows: pr.rows, rate: pr.rate, count: pr.count, kakeCount: pr.kakeCount }, mailedAt: nowStr(), mailedTo: to, mailedBy: ME } }),
     afterSent: to => rememberEmail(o.customerId, to),
     sendId: `om_${o.id}_${o._rev || 0}`,
-    before: async () => { if (DEMO) return; await reloadStrict(); const now = DB.orders.find(x => x.id === o.id); if (now && now.status !== 'new' && now.mailedAt) throw new Error(`この注文の承りメールは、${now.mailedBy || 'ほかの人'}がすでに送っていました（${hm(now.mailedAt)}）。送り直しは不要です`); if (!now || (now._rev || 0) !== (o._rev || 0) || orderFP(now) !== fp) throw new Error('ほかの人が注文や商品・掛け率を直したため、内容が変わりました。もう一度確認してください'); },
+    before: async () => { if (DEMO) return; await reloadStrict(); const now = DB.orders.find(x => x.id === o.id); if (now && now.status !== 'new' && now.mailedAt) throw new Error(now.mailedTo === '' ? `この注文は、${now.mailedBy || 'ほかの人'}が「メールなしで承り済み」にしていました（${hm(now.mailedAt)}）。メールを送る場合は、お客さんに直接ご連絡ください` : `この注文の承りメールは、${now.mailedBy || 'ほかの人'}がすでに送っていました（${hm(now.mailedAt)}）。送り直しは不要です`); if (!now || (now._rev || 0) !== (o._rev || 0) || orderFP(now) !== fp) throw new Error('ほかの人が注文や商品・掛け率を直したため、内容が変わりました。もう一度確認してください'); },
     require: () => ({ fp }),
     onSkip: async () => { const item = { ...o, status: 'mailed', priced: { rows: pr.rows, rate: pr.rate, count: pr.count, kakeCount: pr.kakeCount }, mailedAt: nowStr(), mailedTo: '', mailedBy: ME }; if (DEMO) { await save('orders', item); return; } await reloadStrict(); const now = DB.orders.find(x => x.id === o.id); if (!now || (now._rev || 0) !== (o._rev || 0) || orderFP(now) !== fp) throw new Error('ほかの人が注文や商品・掛け率を直したため、内容が変わりました。もう一度確認してください'); const j = await api('putChecked', { col: 'orders', item, fp }); upsertLocal('orders', j.item); }
   });
@@ -935,7 +938,7 @@ function editOrder(o) {
     <div class="small" style="color:var(--warn)">内容を直すと、ダブルチェックはやり直しになります。</div>
     <label class="f" for="eo-cust">お店<select id="eo-cust"><option value="">（一覧にない：${esc(o.newName || '')}）</option>${DB.customers.map(c => `<option value="${c.id}" ${c.id === o.customerId ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></label>
     <div class="tbl"><table class="lines"><tr><th>試飲会の商品</th><th class="r">本数</th><th class="r" title="無料にする本数">うちサービス</th></tr>${groupRows(prods.map(p => ({ ...p, importerId: p.importerId })), e.importerIds).map(g => `<tr class="imp"><td colspan="3">${esc(g.i.name)}</td></tr>` + g.rows.map(p => `<tr><td>${esc(pname(p))}</td><td class="r"><input type="number" min="0" max="999" data-eq="${p.id}" id="eq-${p.id}" value="${qty[p.id] || ''}" placeholder="0" style="width:72px;text-align:right"></td><td class="r"><input type="number" min="0" max="999" data-ef="${p.id}" value="${free[p.id] ?? ''}" placeholder="${cd.on ? '自動' : '0'}" style="width:64px;text-align:right" aria-label="${esc(pname(p))}のサービス本数"></td></tr>`).join('')).join('')}</table></div>
-    <div class="tiny sub">「うちサービス」は無料にする本数です（例：12本のうち1本サービス → 本数12・サービス1。サービスの本数は「12本以上で70掛け」の本数に数えません）。${cd.on ? `空欄のときは設定どおり「同じ商品${cd.every}本で${cd.free}本無料」が自動で入ります。` : ''}サービスの本数も、掛け率の本数には入ります。</div>
+    <div class="tiny sub">「うちサービス」は無料にする本数です（例：12本のうち1本サービス → 本数12・サービス1。サービスの本数は「12本以上で70掛け」の本数に数えません）。${cd.on ? `空欄のときは設定どおり「同じ商品${cd.every}本で${cd.free}本無料」が自動で入ります。` : ''}</div>
     <div class="stack" style="gap:6px"><b class="small">追加の商品（試飲会に出していないもの）</b>
       <div class="tbl"><table class="lines" id="eo-xt"><tr><th>品名</th><th>インポーター</th><th>上代</th><th>価格</th><th>単価</th><th>本数</th><th>サービス</th><th>税率</th><th></th></tr>${extras.map(xRow).join('')}</table></div>
       <div><button class="btn line sm" id="eo-xadd">＋ 追加の商品を入れる</button> <span class="tiny sub">「掛け率」にすると上代に掛け率がかかり、本数は合算されます。決まった値段で売るときは「単価指定」にして単価（税抜）を入れてください。</span></div></div>
