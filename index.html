@@ -791,11 +791,53 @@ function vOrders(el) {
     if (a === 'arrive') arriveOrder(o);
     if (a === 'deliver') deliverOrder(o);
     if (a === 'undeliver') confirmBox(`No.${o.no} を${o.arrivedAt ? '「入荷連絡済み」' : '「承り済み」'}に戻しますか？`, '戻す', async () => { await save('orders', { ...o, status: o.arrivedAt ? 'arrived' : 'mailed', deliveredAt: '', deliveryId: '' }); });
+    if (a === 'merge') mergeOrders(o);
     if (a === 'cancel') confirmBox(`No.${o.no} の注文を取り消しますか？`, '取り消す', async () => { await save('orders', { ...o, status: 'cancel' }); });
     if (a === 'restore') { const gone = o.lines.filter(l => !l.custom && !prod(l.productId)); if (gone.length) { toast('この注文に入っている商品が削除されているため、元に戻せません。新しく注文を入れ直してください'); return; } } if (a === 'restore') confirmBox(`No.${o.no} の注文を元に戻しますか？`, '元に戻す', async () => { await save('orders', { ...o, status: 'new', checks: {}, checkFps: {}, priced: null }); });
   };
 }
 function orderCustName(o) { const c = cust(o.customerId); return c ? esc(c.name) : esc(o.newName || '（店名なし）') + (o.customerId ? '' : '　<span class="pill p-new">新規</span>'); }
+// 同じお店の注文をまとめられる相手（まだ納品前・取消でないもの）
+const shopKey = x => x.customerId ? 'c:' + x.customerId : 'n:' + kataQ(x.newName || '');
+const MERGEABLE = ['new', 'mailed'];
+function mergeGroup(o) {
+  if (!MERGEABLE.includes(o.status) || shopKey(o) === 'n:') return [];
+  return DB.orders.filter(x => x.eventId === o.eventId && MERGEABLE.includes(x.status) && !x.sending && shopKey(x) === shopKey(o)).sort((a, b) => (a.no || 0) - (b.no || 0));
+}
+// 「まとめる」：同じお店の注文を、いちばん番号の小さい注文に1つにまとめる（押した時点の合計本数で掛け率が決まる）。ほかの注文は「取消（まとめ済み）」にする
+function mergeOrders(o) {
+  const g = mergeGroup(o); if (g.length < 2) { toast('まとめる注文がありません'); return; }
+  const base = g[0], rest = g.slice(1);
+  const build = () => {
+    const lines = []; const idx = {};
+    g.forEach(x => (x.lines || []).forEach(l => {
+      if (l.custom || !prod(l.productId)) { lines.push({ ...l }); return; }
+      if (idx[l.productId] == null) { idx[l.productId] = lines.length; lines.push({ productId: l.productId, qty: 0 }); }
+      const t = lines[idx[l.productId]]; t.qty += +l.qty || 0;
+      if (l.free != null && l.free !== '') t.free = (+t.free || 0) + (parseInt(l.free, 10) || 0);
+    }));
+    return lines.filter(l => +l.qty > 0);
+  };
+  const lines = build(); const pr = priceLines(lines);
+  const mailed = g.filter(x => x.status === 'mailed');
+  const msg = `${g.map(x => `No.${x.no}（${orderPriced(x).count}本）`).join('・')} を No.${base.no} に1つにまとめます。\n\n`
+    + `まとめた後：合計${pr.count}本・${pr.rate}掛け・税込${yen(pr.total)}\n\n`
+    + `・${rest.map(x => 'No.' + x.no).join('・')} は「取消（まとめ済み）」になります\n・内容が変わるので、藤井さん・北田さんの✓をやり直してください`
+    + (mailed.length ? `\n・${mailed.map(x => 'No.' + x.no).join('・')} は承りメールを送り済みです。まとめた内容で、承りメールをもう一度送ってください` : '');
+  confirmBox(msg, 'まとめる', async () => {
+    try { await reloadStrict(); } catch (e) { toast('最新の状態を読み込めませんでした：' + e.message); return; }
+    const now = g.map(x => DB.orders.find(y => y.id === x.id));
+    if (now.some((y, i) => !y || (y._rev || 0) !== (g[i]._rev || 0))) { render(); toast('ほかの人がこの注文を変えたため、まとめませんでした。内容を確かめて、もう一度「まとめる」を押してください'); return; }
+    const notes = g.map(x => (x.note || '').trim()).filter(Boolean);
+    const merged = { ...base, lines: build(), note: notes.length > 1 ? g.filter(x => (x.note || '').trim()).map(x => `No.${x.no}：${x.note.trim()}`).join(' / ') : (notes[0] || ''),
+      email: base.email || (rest.find(x => x.email) || {}).email || '', tel: base.tel || (rest.find(x => x.tel) || {}).tel || '',
+      status: 'new', checks: {}, checkFps: {}, priced: null, mailedAt: '', mailedTo: undefined, mailedBy: '', prevMailedAt: base.mailedAt || base.prevMailedAt || '', mergedFrom: [...(base.mergedFrom || []), ...rest.map(x => x.no)], mergedAt: nowStr(), mergedBy: ME };
+    const items = [merged, ...rest.map(x => ({ ...x, status: 'cancel', mergedInto: base.no, mergedAt: nowStr(), mergedBy: ME }))];
+    const r = await saveMany('orders', items);
+    if (r.ng.length) { try { await reloadStrict(); } catch (_) {} render(); toast('一部をまとめられませんでした（' + r.ng.map(x => x.error).join('、') + '）。画面を確かめてください'); return; }
+    render(); toast(`No.${base.no} にまとめました（${pr.count}本・${pr.rate}掛け）。✓をやり直してください`);
+  });
+}
 // 同じお店の注文がこのイベントにほかにもあるとき（追加注文など）に知らせる。掛け率は注文ごとに計算されるため
 function sameShopNote(o, pr) {
   if (o.status === 'cancel') return '';
@@ -806,7 +848,7 @@ function sameShopNote(o, pr) {
   const cnt = others.reduce((a, x) => a + orderPriced(x).count, 0) + pr.count;
   const kc = others.reduce((a, x) => a + orderPriced(x).kakeCount, 0) + pr.kakeCount; // 掛け率の判定に使う本数（サービスは除く）
   const th = +S().rate.threshold;
-  return `<div class="small" style="background:var(--warnSoft);color:var(--warn);border-radius:6px;padding:6px 9px">⚠ このお店の注文がほかにもあります（${others.map(x => `No.${x.no}・${orderPriced(x).count}本`).join('、')}）。合わせると${cnt}本${kc !== cnt ? `（サービスを除くと${kc}本）` : ''}です。掛け率は注文ごとに計算しています${pr.kakeCount < th && kc >= th ? `。まとめて${S().rate.over}掛けにする場合は、片方の「内容を直す」で本数をまとめてから、もう片方を「取消」してください` : ''}。</div>`;
+  return `<div class="small" style="background:var(--warnSoft);color:var(--warn);border-radius:6px;padding:6px 9px">⚠ このお店の注文がほかにもあります（${others.map(x => `No.${x.no}・${orderPriced(x).count}本`).join('、')}）。合わせると${cnt}本${kc !== cnt ? `（サービスを除くと${kc}本）` : ''}です。掛け率は注文ごとに計算しています${pr.kakeCount < th && kc >= th ? `。「まとめる」を押すと1つの注文になり、合計本数で${S().rate.over}掛けになります` : ''}。${mergeGroup(o).length >= 2 ? ` <button class="btn sm" data-act="merge" data-id="${o.id}" style="margin-left:6px">まとめる</button>` : ''}</div>`;
 }
 function orderCard(o) {
   const pr = orderPriced(o); const e = evt(o.eventId); const st = o.status === 'delivered' && !o.deliveryId ? ['お届け済み', 'p-ok'] : (OST[o.status] || OST.new);
@@ -833,10 +875,10 @@ function orderCard(o) {
   } else if (o.status === 'delivered') {
     { const dv = DB.deliveries.find(d => d.id === o.deliveryId); actions = `<span class="small sub">${jd(o.deliveredAt)}納品 → ${ymLabel(dv ? delYM(dv) : billYM(o.deliveredAt))}の請求書に入っています</span>`; }
   }
-  const more = o.status === 'cancel' ? `<button class="btn line sm" data-act="restore" data-id="${o.id}">元に戻す</button>` : (o.status !== 'delivered' ? `<button class="btn line sm" data-act="cancel" data-id="${o.id}" style="color:var(--bad)">取消</button>` : '');
+  const more = o.status === 'cancel' && o.mergedInto ? `<span class="small sub">No.${o.mergedInto} にまとめました（${esc(o.mergedBy || '')}）</span>` : o.status === 'cancel' ? `<button class="btn line sm" data-act="restore" data-id="${o.id}">元に戻す</button>` : (o.status !== 'delivered' ? `<button class="btn line sm" data-act="cancel" data-id="${o.id}" style="color:var(--bad)">取消</button>` : '');
   return `<div class="card ord s-${o.status} stack" style="gap:8px">
     <div class="row"><h3 class="grow">No.${o.no}　${orderCustName(o)}${o.example ? ' <span class="ex">例</span>' : ''}</h3><span class="pill ${st[1]}">${st[0]}</span></div>
-    <div class="tiny sub">${hm(o.createdAt) ? jd(o.createdAt) + ' ' + hm(o.createdAt) + ' 受付' : ''}${o.byStaff ? `・${esc(o.byStaff)}が代理入力` : ''}${o.mailedAt ? `・承りメール ${jd(o.mailedAt)} ${hm(o.mailedAt)}` : ''}${o.mailedTo === '' && o.status !== 'new' ? '・メールなし' : ''}${o.email && !cust(o.customerId) ? `・✉ ${esc(o.email)}` : ''}${orderTel(o)}</div>
+    <div class="tiny sub">${hm(o.createdAt) ? jd(o.createdAt) + ' ' + hm(o.createdAt) + ' 受付' : ''}${o.byStaff ? `・${esc(o.byStaff)}が代理入力` : ''}${o.mergedFrom && o.mergedFrom.length ? `・No.${o.mergedFrom.join('・No.')}をまとめた注文（${esc(o.mergedBy || '')}）` : ''}${o.mailedAt ? `・承りメール ${jd(o.mailedAt)} ${hm(o.mailedAt)}` : ''}${o.mailedTo === '' && o.status !== 'new' ? '・メールなし' : ''}${o.email && !cust(o.customerId) ? `・✉ ${esc(o.email)}` : ''}${orderTel(o)}</div>
     <div class="tbl"><table class="lines">${byImp.map(g => `<tr class="imp"><td colspan="4">${esc(g.i.name)}</td></tr>` + g.rows.map(x => `<tr><td>${esc(x.name)}</td><td class="r num">${x.qty}本</td><td class="r num sub">@${comma(x.price)}</td><td class="r num">${yen(x.price * x.qty)}</td></tr>`).join('')).join('')}</table></div>
     <div class="row small"><span class="grow sub">${pr.count}本・<b style="color:var(--ink)">${pr.rate}掛け</b>${o.priced ? '（金額確定）' : ''}</span><span class="num">税込 <b style="font-size:16px">${yen(pr.total)}</b></span></div>
     ${o.note ? `<div class="small" style="background:var(--muted);border-radius:6px;padding:6px 9px">💬 ${esc(o.note)}</div>` : ''}
