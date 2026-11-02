@@ -155,7 +155,6 @@ table.list td.r,table.list th.r{text-align:right}
 <div id="ovl"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
 /* =========================================================
    農と発酵 Zen 注文・請求アプリ
@@ -187,6 +186,8 @@ const hm = s => s ? s.slice(11, 16) : '';
 function toast(t) { const el = $('#toast'); el.textContent = t; el.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => el.hidden = true, 2600); }
 function lsGet(k) { try { return localStorage.getItem(k); } catch (_) { return null; } }
 function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (_) {} }
+// Excelを読む部品は、使うときだけ読み込む（お客さんの注文画面を軽くするため）
+function loadXLSX() { if (typeof XLSX !== 'undefined') return Promise.resolve(); if (window._xlsxP) return window._xlsxP; window._xlsxP = new Promise((ok, ng) => { const sc = document.createElement('script'); sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js'; sc.onload = () => ok(); sc.onerror = () => { window._xlsxP = null; ng(new Error('Excelを読む部品が読み込めませんでした（電波を確認して、もう一度ファイルを選んでください）')); }; document.head.appendChild(sc); }); return window._xlsxP; }
 function ssGet(k) { try { return sessionStorage.getItem(k); } catch (_) { return null; } }
 function ssSet(k, v) { try { sessionStorage.setItem(k, v); } catch (_) {} }
 function ssDel(k) { try { sessionStorage.removeItem(k); } catch (_) {} }
@@ -483,6 +484,7 @@ function mailPreview(opt) {
         if (opt.before) await opt.before();
         await sendMail({ to, subject: $('#mp-sub').value, body: $('#mp-body').value, ...(opt.extra ? opt.extra() : {}) }, opt.after ? opt.after(to) : null, { sendId, require: opt.require ? opt.require() : null });
       } catch (e) {
+        if (/すでに送っていました/.test(e.message)) { closeModal(); render(); toast(e.message); return; }
         const known = /CONFLICT|ほかの人|宛先|確認がそろって|内容が変わ|送信中|送信済み/.test(e.message);
         toast(known ? '送信しませんでした：' + e.message : '送れたかどうか確認できませんでした。この画面のまま、もう一度「この内容で送信する」を押してください（送れていた場合は送り直しません）');
         const b = $('#mp-send'); if (b) { b.disabled = false; b.textContent = 'この内容で送信する'; } return;
@@ -505,7 +507,10 @@ async function startShop(eventId, importerId, fromStaff) {
   const e = evt(eventId);
   if (!e) { $('#app').innerHTML = '<div class="wrap"><div class="empty" style="margin-top:20vh">注文ページが見つかりません</div></div>'; return; }
   SHOP = { clientId: uid('c'), eventId, importer: importerId && e.importerIds.includes(importerId) ? importerId : e.importerIds[0], customerId: '', newName: '', newEmail: '', note: '', cart: {}, step: 'items', q: '', fromStaff: !!fromStaff, no: null };
-  if (!fromStaff) { try { const pd = JSON.parse(ssGet('zen-pending') || 'null'); if (pd && pd.shop && pd.shop.eventId === eventId && Date.now() - pd.at < 864e5) { SHOP = { ...pd.shop, fromStaff: false, no: null }; { const okIds = new Set(shopProducts(e).map(p => p.id)); Object.keys(SHOP.cart || {}).forEach(id => { if (!okIds.has(id)) delete SHOP.cart[id]; }); } setTimeout(() => toast('前回の注文が送れたか確認できていなかったので、内容を戻しました。もう一度「この内容で注文する」を押してください（二重には登録されません）'), 300); } } catch (_) {} }
+  // 入力途中の内容・送信中の注文は、この端末に残す（タブを閉じたり、QRを読み直したりしても戻る。送り直しても二重にならない）
+  if (!fromStaff) { try { const pd = JSON.parse(lsGet('zen-pending') || ssGet('zen-pending') || 'null'); if (pd && pd.shop && pd.shop.eventId === eventId && Date.now() - pd.at < 864e5 && pd.shop.clientId) { SHOP = { ...pd.shop, fromStaff: false, no: null, step: pd.sent ? 'confirm' : (pd.shop.step === 'confirm' ? 'confirm' : 'items') }; { const okIds = new Set(shopProducts(e).map(p => p.id)); Object.keys(SHOP.cart || {}).forEach(id => { if (!okIds.has(id)) delete SHOP.cart[id]; }); }
+    if (pd.sent) setTimeout(() => toast('前回の注文が送れたか確認できていなかったので、内容を戻しました。もう一度「この内容で注文する」を押してください（二重には登録されません）'), 300);
+    else if (Object.values(SHOP.cart || {}).some(q => q > 0) || SHOP.customerId || SHOP.newName) setTimeout(() => toast('入力の途中の内容を戻しました'), 300); } } catch (_) {} }
   renderShop();
 }
 function needContact(c) { return !c || c.hasEmail === false || (DEMO && !c.email); }
@@ -525,14 +530,14 @@ function barInner(pr) {
 // 本数を打っている間は下の合計だけ更新（画面全体を書き直すと「確認へ」が1回で押せなくなるため）
 function updateBar() {
   const lines = Object.entries(SHOP.cart).filter(([, q]) => q > 0).map(([productId, qty]) => ({ productId, qty }));
-  const pr = priceLines(lines); SHOP._rate = pr.rate;
+  const pr = priceLines(lines); SHOP._rate = pr.rate; saveDraft();
   const info = $('#sh-barinfo'); if (info) info.innerHTML = barInfo(pr);
   const nx = $('#sh-next'); if (nx) nx.disabled = !pr.count;
   document.querySelectorAll('[data-pr]').forEach(el => { const p = prod(el.dataset.pr); if (p) el.innerHTML = priceText(p, pr.rate); });
   const e = evt(SHOP.eventId); document.querySelectorAll('.itabs [data-imp]').forEach(b => { const iid = b.dataset.imp; const n = shopProducts(e, iid).reduce((a, p) => a + (SHOP.cart[p.id] || 0), 0); b.textContent = imp(iid).name + (n ? ` · ${n}本` : ''); });
 }
 function goConfirm() { document.querySelectorAll('[data-q]').forEach(i => { SHOP.cart[i.dataset.q] = Math.max(0, Math.min(999, parseInt(i.value, 10) || 0)); });
-  if (!(SHOP.customerId || SHOP.newName)) { toast('① お店を選んでください'); const q = $('#sh-q') || $('#sh-repick'); if (q) { q.scrollIntoView({ behavior: 'smooth', block: 'center' }); if (q.focus) q.focus(); } return; } SHOP.step = 'confirm'; renderShop(); scrollTo(0, 0); }
+  if (!(SHOP.customerId || SHOP.newName)) { toast('① お店を選んでください'); const q = $('#sh-q') || $('#sh-repick'); if (q) { q.scrollIntoView({ behavior: 'smooth', block: 'center' }); if (q.focus) q.focus(); } return; } SHOP.step = 'confirm'; try { history.pushState({ zen: 'confirm' }, ''); } catch (_) {} renderShop(); scrollTo(0, 0); }
 function renderShop() {
   const e = evt(SHOP.eventId); const s = S(); const r = s.rate;
   const lines = Object.entries(SHOP.cart).filter(([, q]) => q > 0).map(([productId, qty]) => ({ productId, qty }));
@@ -565,7 +570,7 @@ function renderShop() {
       <div class="row"><button class="btn ghost" id="sh-edit">← 戻って直す</button><button class="btn grow" id="sh-send">この内容で注文する</button></div></div>`;
   } else {
     const q = SHOP.q.trim();
-    const kq = kataQ(q); const cs = DB.customers.filter(c => (SHOP.fromStaff || c.shop !== false) && (!q || c.name.toLowerCase().includes(q.toLowerCase()) || kataQ(c.name).includes(kq) || (c.kana && kataQ(c.kana).includes(kq))));
+    const kq = kataQ(q); const cs = DB.customers.filter(c => (SHOP.fromStaff || c.shop !== false) && (!q || c.name.toLowerCase().includes(q.toLowerCase()) || kataQ(c.name).includes(kq) || (c.kana && (kataQ(c.kana).includes(kq) || (kataQ(c.kana).length >= 4 && kq.startsWith(kataQ(c.kana)))))));
     const c = cust(SHOP.customerId);
     const pickHtml = SHOP.customerId || SHOP.newName ?
       `<div class="row"><div class="grow"><div class="small sub">ご注文のお店</div><div style="font-weight:700;font-size:17px">${esc(c ? c.name : SHOP.newName)}</div></div><button class="btn line sm" id="sh-repick">変更</button></div>` :
@@ -596,6 +601,7 @@ function renderShop() {
   $('#app').innerHTML = `<div class="wrap">${staffBar}${demoBar}
     <div class="shop-h"><div class="k">${esc(s.shop.name)}</div><h1>${esc(e.name)}</h1><div class="sub small">${jdy(e.date)}　ご注文フォーム</div></div>
     ${e.open === false && !SHOP.fromStaff ? '<div class="empty">このイベントの注文受付は終了しました</div>' : body}</div>${e.open === false && !SHOP.fromStaff ? '' : bar}`;
+  saveDraft();
   bindShop();
 }
 function bindShop() {
@@ -608,8 +614,9 @@ function bindShop() {
   if ($('#sh-repick')) $('#sh-repick').onclick = () => { SHOP.customerId = ''; SHOP.newName = ''; renderShop(); };
   if ($('#sh-newok')) $('#sh-newok').onclick = () => { const n = $('#sh-nn').value.trim(), m = $('#sh-ne').value.trim(); if (!n) { toast('店名を入れてください'); return; } SHOP.newName = n; SHOP.newEmail = m; renderShop(); };
   if ($('#sh-next')) $('#sh-next').onclick = goConfirm;
+  ['sh-note', 'sh-mail', 'sh-tel'].forEach(id => { const el = $('#' + id); if (el) el.addEventListener('input', () => { if (id === 'sh-note') SHOP.note = el.value; else if (id === 'sh-mail') SHOP.newEmail = el.value; else SHOP.tel = el.value; saveDraft(); }); });
   if ($('#sh-edit')) $('#sh-edit').onclick = () => { SHOP.note = $('#sh-note').value; if ($('#sh-mail')) SHOP.newEmail = $('#sh-mail').value; if ($('#sh-tel')) SHOP.tel = $('#sh-tel').value; SHOP.step = 'items'; renderShop(); };
-  if ($('#sh-again')) $('#sh-again').onclick = () => { SHOP = { ...SHOP, clientId: uid('c'), customerId: '', newName: '', newEmail: '', tel: '', note: '', cart: {}, step: 'items', q: '', draftName: '', draftEmail: '' }; renderShop(); scrollTo(0, 0); };
+  if ($('#sh-again')) $('#sh-again').onclick = () => { lsDel('zen-pending'); SHOP = { ...SHOP, clientId: uid('c'), customerId: '', newName: '', newEmail: '', tel: '', note: '', cart: {}, step: 'items', q: '', draftName: '', draftEmail: '' }; renderShop(); scrollTo(0, 0); };
   if ($('#sh-send')) $('#sh-send').onclick = async () => {
     SHOP.note = $('#sh-note').value.trim();
     if ($('#sh-mail')) { SHOP.newEmail = $('#sh-mail').value.trim(); if (SHOP.newEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(SHOP.newEmail)) { toast('メールアドレスの形を確認してください'); return; } }
@@ -618,16 +625,16 @@ function bindShop() {
     const btn = $('#sh-send'); btn.disabled = true; btn.textContent = '送信中…';
     const lines = Object.entries(SHOP.cart).filter(([, q]) => q > 0).map(([productId, qty]) => ({ productId, qty }));
     const payload = { clientId: SHOP.clientId, eventId: SHOP.eventId, customerId: SHOP.customerId, newName: SHOP.newName, email: SHOP.newEmail, tel: SHOP.tel || '', note: SHOP.note, lines, byStaff: SHOP.fromStaff ? ME : '' };
-    if (!SHOP.fromStaff) ssSet('zen-pending', JSON.stringify({ at: Date.now(), shop: { ...SHOP, step: 'confirm' } }));
+    if (!SHOP.fromStaff) { SHOP.step = 'confirm'; saveDraft(true); }
     try {
       if (DEMO) {
         const dup = DB.orders.find(o => o.clientId && o.clientId === SHOP.clientId);
         const no = dup ? dup.no : DB.orders.filter(o => o.eventId === SHOP.eventId).reduce((a, o) => Math.max(a, o.no || 0), 0) + 1;
         if (!dup) { DB.orders.push({ id: uid('o'), no, ...payload, status: 'new', checks: {}, createdAt: nowStr() }); persist(); } SHOP.no = no;
       } else { const j = await api('submitOrder', { order: payload, token: SHOP.fromStaff ? TOKEN : undefined }); SHOP.no = j.no; }
-      ssDel('zen-pending'); SHOP.step = 'done'; renderShop(); scrollTo(0, 0);
+      ssDel('zen-pending'); if (!SHOP.fromStaff) lsDel('zen-pending'); SHOP.step = 'done'; renderShop(); scrollTo(0, 0);
     } catch (e) {
-      if (e.data && e.data.soldOut) { const id = e.data.soldOut; const p = prod(id); delete SHOP.cart[id]; if (p) p.active = false; ssSet('zen-pending', JSON.stringify({ at: Date.now(), shop: { ...SHOP, step: 'confirm' } })); renderShop(); scrollTo(0, 0); toast(`${e.message}。注文から外したので、内容を確かめてもう一度「この内容で注文する」を押してください`); return; }
+      if (e.data && e.data.soldOut) { const id = e.data.soldOut; const p = prod(id); delete SHOP.cart[id]; if (p) p.active = false; SHOP.step = 'confirm'; saveDraft(true); renderShop(); scrollTo(0, 0); toast(`${e.message}。注文から外したので、内容を確かめてもう一度「この内容で注文する」を押してください`); return; }
       toast(/売り切れ|本数|店名|連絡先|メール|電話|商品|受付|お店|前の注文/.test(e.message) ? e.message : '送信できませんでした。もう一度「注文する」を押してください（二重には登録されません）'); btn.disabled = false; btn.textContent = 'この内容で注文する'; }
   };
   app.onclick = ev => {
@@ -638,11 +645,26 @@ function bindShop() {
     if (t.dataset.m) { SHOP.cart[t.dataset.m] = Math.max(0, (SHOP.cart[t.dataset.m] || 0) - 1); renderShopKeep(); }
   };
   app.oninput = ev => { const t = ev.target; if (!t.dataset) return;
-    if (t.dataset.draft) SHOP[t.dataset.draft] = t.value;
+    if (t.dataset.draft) { SHOP[t.dataset.draft] = t.value; saveDraft(); }
     if (t.dataset.q) { SHOP.cart[t.dataset.q] = Math.max(0, Math.min(999, parseInt(t.value, 10) || 0)); updateBar(); } };
   app.onchange = ev => { const t = ev.target; if (t.dataset && t.dataset.q) updateBar(); };
 }
 function renderShopKeep() { const y = scrollY; renderShop(); scrollTo(0, y); }
+// お客さんの入力途中の内容をこの端末に残す（送信済みの印 sent は、送信の結果がわかるまで消さない）
+function saveDraft(sent) {
+  if (!SHOP || SHOP.fromStaff || SHOP.step === 'done') return;
+  let wasSent = false; try { const pd = JSON.parse(lsGet('zen-pending') || 'null'); wasSent = !!(pd && pd.sent && pd.shop && pd.shop.clientId === SHOP.clientId); } catch (_) {}
+  lsSet('zen-pending', JSON.stringify({ at: Date.now(), sent: !!sent || wasSent, shop: { ...SHOP, _rate: undefined } }));
+}
+// ブラウザの「戻る」：確認画面からは選ぶ画面に戻す（ページから出てしまわないように）
+window.addEventListener('popstate', ev => {
+  if (!SHOP) return;
+  // 「進む」で確認画面に戻る
+  if (SHOP.step === 'items' && ev.state && ev.state.zen === 'confirm' && (SHOP.customerId || SHOP.newName) && Object.values(SHOP.cart || {}).some(q => q > 0)) { SHOP.step = 'confirm'; renderShop(); scrollTo(0, 0); return; }
+  if (SHOP.step !== 'confirm') return;
+  if ($('#sh-note')) SHOP.note = $('#sh-note').value; if ($('#sh-mail')) SHOP.newEmail = $('#sh-mail').value; if ($('#sh-tel')) SHOP.tel = $('#sh-tel').value;
+  SHOP.step = 'items'; renderShop(); scrollTo(0, 0);
+});
 
 /* =========================================================
    管理画面
@@ -764,6 +786,17 @@ function vOrders(el) {
   };
 }
 function orderCustName(o) { const c = cust(o.customerId); return c ? esc(c.name) : esc(o.newName || '（店名なし）') + (o.customerId ? '' : '　<span class="pill p-new">新規</span>'); }
+// 同じお店の注文がこのイベントにほかにもあるとき（追加注文など）に知らせる。掛け率は注文ごとに計算されるため
+function sameShopNote(o, pr) {
+  if (o.status === 'cancel') return '';
+  const key = x => x.customerId ? 'c:' + x.customerId : 'n:' + kataQ(x.newName || '');
+  if (key(o) === 'n:') return '';
+  const others = DB.orders.filter(x => x.id !== o.id && x.eventId === o.eventId && x.status !== 'cancel' && key(x) === key(o));
+  if (!others.length) return '';
+  const cnt = others.reduce((a, x) => a + orderPriced(x).count, 0) + pr.count;
+  const th = +S().rate.threshold;
+  return `<div class="small" style="background:var(--warnSoft);color:var(--warn);border-radius:6px;padding:6px 9px">⚠ このお店の注文がほかにもあります（${others.map(x => `No.${x.no}・${orderPriced(x).count}本`).join('、')}）。合わせると${cnt}本です。掛け率は注文ごとに計算しています${pr.count < th && cnt >= th ? `。まとめて${S().rate.over}掛けにする場合は、片方の「内容を直す」で本数をまとめてから、もう片方を「取消」してください` : ''}。</div>`;
+}
 function orderCard(o) {
   const pr = orderPriced(o); const e = evt(o.eventId); const st = o.status === 'delivered' && !o.deliveryId ? ['お届け済み', 'p-ok'] : (OST[o.status] || OST.new);
   const byImp = groupRows(pr.rows, e ? e.importerIds : []);
@@ -796,6 +829,7 @@ function orderCard(o) {
     <div class="tbl"><table class="lines">${byImp.map(g => `<tr class="imp"><td colspan="4">${esc(g.i.name)}</td></tr>` + g.rows.map(x => `<tr><td>${esc(x.name)}</td><td class="r num">${x.qty}本</td><td class="r num sub">@${comma(x.price)}</td><td class="r num">${yen(x.price * x.qty)}</td></tr>`).join('')).join('')}</table></div>
     <div class="row small"><span class="grow sub">${pr.count}本・<b style="color:var(--ink)">${pr.rate}掛け</b>${o.priced ? '（金額確定）' : ''}</span><span class="num">税込 <b style="font-size:16px">${yen(pr.total)}</b></span></div>
     ${o.note ? `<div class="small" style="background:var(--muted);border-radius:6px;padding:6px 9px">💬 ${esc(o.note)}</div>` : ''}
+    ${sameShopNote(o, pr)}
     ${o.status === 'new' ? `<div class="row"><span class="tiny sub">ダブルチェック</span><div class="checks">${checkBtns}</div></div>` : ''}
     <div class="row" style="justify-content:flex-end;gap:6px">${more}<span class="grow"></span>${actions}</div>
   </div>`;
@@ -820,7 +854,7 @@ function mailOrder(o) {
     after: to => ({ col: 'orders', item: { ...o, status: 'mailed', priced: { rows: pr.rows, rate: pr.rate, count: pr.count, kakeCount: pr.kakeCount }, mailedAt: nowStr(), mailedTo: to, mailedBy: ME } }),
     afterSent: to => rememberEmail(o.customerId, to),
     sendId: `om_${o.id}_${o._rev || 0}`,
-    before: async () => { if (DEMO) return; await reloadStrict(); const now = DB.orders.find(x => x.id === o.id); if (!now || (now._rev || 0) !== (o._rev || 0) || orderFP(now) !== fp) throw new Error('ほかの人が注文や商品・掛け率を直したため、内容が変わりました。もう一度確認してください'); },
+    before: async () => { if (DEMO) return; await reloadStrict(); const now = DB.orders.find(x => x.id === o.id); if (now && now.status !== 'new' && now.mailedAt) throw new Error(`この注文の承りメールは、${now.mailedBy || 'ほかの人'}がすでに送っていました（${hm(now.mailedAt)}）。送り直しは不要です`); if (!now || (now._rev || 0) !== (o._rev || 0) || orderFP(now) !== fp) throw new Error('ほかの人が注文や商品・掛け率を直したため、内容が変わりました。もう一度確認してください'); },
     require: () => ({ fp }),
     onSkip: async () => { const item = { ...o, status: 'mailed', priced: { rows: pr.rows, rate: pr.rate, count: pr.count, kakeCount: pr.kakeCount }, mailedAt: nowStr(), mailedTo: '', mailedBy: ME }; if (DEMO) { await save('orders', item); return; } await reloadStrict(); const now = DB.orders.find(x => x.id === o.id); if (!now || (now._rev || 0) !== (o._rev || 0) || orderFP(now) !== fp) throw new Error('ほかの人が注文や商品・掛け率を直したため、内容が変わりました。もう一度確認してください'); const j = await api('putChecked', { col: 'orders', item, fp }); upsertLocal('orders', j.item); }
   });
@@ -1096,7 +1130,7 @@ function vInvoices(el) {
     </div>
     ${unbilled && billFromApp() ? `<div class="small" style="background:var(--warnSoft);color:var(--warn);border-radius:8px;padding:8px 11px">承り済みでまだ「納品済み」になっていない注文が ${unbilled}件あります。納品済みにすると請求書に入ります。</div>` : ''}
     ${ready.length > 1 ? `<div class="row"><span class="grow small sub">ダブルチェック済みで未送信：${ready.length}件<span id="iv-quota"></span></span><button class="btn" id="iv-bulk">まとめて送信</button></div>` : ''}
-    ${invs.map(x => { const sfp = x.rec.status === 'sent' ? x.rec.sentFp : (x.rec.pdfFp || x.rec.sentFp); const changed = (x.rec.status === 'sent' || x.rec.status === 'pdf') && (sfp ? sfp !== invFP(x) : +x.rec.sentTotal !== x.total); const st = changed ? ['送信後に変更あり', 'p-bad'] : (IST[x.rec.status === 'draft' && invAllChecked(x.rec, x.total, x) ? 'checked' : x.rec.status] || IST.draft);
+    ${invs.map(x => { const sfp = x.rec.status === 'sent' ? x.rec.sentFp : (x.rec.pdfFp || x.rec.sentFp); const changed = (x.rec.status === 'sent' || x.rec.status === 'pdf') && (sfp ? sfp !== invFP(x) : +x.rec.sentTotal !== x.total); const st = changed ? [x.rec.status === 'sent' ? '送信後に変更あり' : 'PDF作成後に変更あり', 'p-bad'] : (IST[x.rec.status === 'draft' && invAllChecked(x.rec, x.total, x) ? 'checked' : x.rec.status] || IST.draft);
       return `<button class="card row" data-inv="${x.c.id}" style="text-align:left;width:100%">
         <div class="grow"><div style="font-weight:700;font-size:16px">${esc(x.c.name)}</div>
           <div class="tiny sub">納品 ${x.dels.length}回・${x.c.email ? esc(x.c.email) : '<span style="color:var(--warn)">メール未登録</span>'}</div>
@@ -1141,7 +1175,10 @@ function openInvoice(customerId) {
     $('#iv-print').onclick = () => printDoc(invoiceDoc(inv, rec.issuedAt || todayStr()), `請求書_${inv.c.name}_${inv.ym}`);
     if ($('#iv-pdf')) $('#iv-pdf').onclick = async () => {
       $('#iv-pdf').disabled = true; $('#iv-pdf').textContent = '作成中…';
-      try { const j = await api('makePdf', { html: invoiceDoc(inv, todayStr()), name: `請求書_${inv.c.name}_${inv.ym}.pdf` }); await saveRec({ status: rec.status === 'sent' ? 'sent' : 'pdf', pdfAt: nowStr(), issuedAt: rec.issuedAt || todayStr(), pdfUrl: j.url, pdfFp: fp });
+      // 作る直前に最新の内容を読み直し、全員の✓がその内容に付いているか確かめる（ほかの人が伝票を直していたら作らない）
+      try { await reloadStrict(); } catch (e) { toast('最新の状態を読み込めませんでした：' + e.message); $('#iv-pdf').disabled = false; $('#iv-pdf').textContent = 'PDFをドライブに保存'; return; }
+      { const inv2 = buildInvoice(inv.customerId, inv.ym); if (invFP(inv2) !== fp || !invAllChecked(inv2.rec, inv2.total, inv2)) { closeModal(); render(); toast('ほかの人が伝票や確認を変えたため、内容が変わりました。開き直して、もう一度確認してください'); return; } }
+      try { const j = await api('makePdf', { html: invoiceDoc(inv, rec.issuedAt || todayStr()), name: `請求書_${inv.c.name}_${inv.ym}.pdf` }); await saveRec({ status: rec.status === 'sent' ? 'sent' : 'pdf', pdfAt: nowStr(), issuedAt: rec.issuedAt || todayStr(), pdfUrl: j.url, pdfFp: fp });
         openModal('PDFを作りました', `<p>Googleドライブの「請求書PDF」フォルダに保存しました。</p><p><a href="${esc(j.url)}" target="_blank" rel="noopener">PDFを開く</a>（開いて印刷すると郵送できます）</p>`); render();
       } catch (e) { toast('PDFを作れませんでした：' + e.message); $('#iv-pdf').disabled = false; }
     };
@@ -1251,7 +1288,7 @@ function editDelivery(d) {
     mb.onchange = () => calc();
     $('#dv-addl').onclick = () => { const ls = read(); ls.push({ name: '', list: '', price: '', qty: 1, tax: 10 }); redraw(ls); };
     mb.onclick = ev => { const b = ev.target.closest('[data-rm]'); if (!b) return; const ls = read(); ls.splice(+b.dataset.rm, 1); if (!ls.length) ls.push({ name: '', list: '', price: '', qty: 1, tax: 10 }); redraw(ls); };
-    if ($('#dv-del')) $('#dv-del').onclick = () => confirmBox('この納品を削除しますか？請求書からも消えます。', '削除する', async () => {
+    if ($('#dv-del')) $('#dv-del').onclick = () => confirmBox(d.pos ? 'この伝票を削除しますか？請求書からも消えます。\n\n※ レジのデータを取り込み直しても、この伝票は戻りません（間違えて消した場合は「＋ レシートの内容を入れる」で入れ直してください）。' : 'この納品を削除しますか？請求書からも消えます。', '削除する', async () => {
       await removeItem('deliveries', d.id);
       if (d.orderId) { const o = DB.orders.find(x => x.id === d.orderId); if (o && o.status === 'delivered') await save('orders', { ...o, status: o.arrivedAt ? 'arrived' : 'mailed', deliveredAt: '', deliveryId: '' }); }
     });
@@ -1611,9 +1648,9 @@ function pasteProducts() {
     $('#pp-file').onchange = ev => {
       const f = ev.target.files[0]; if (!f) return;
       const rd = new FileReader();
-      rd.onload = () => {
+      rd.onload = async () => {
         try {
-          if (typeof XLSX === 'undefined') throw new Error('Excelを読む部品が読み込めませんでした');
+          await loadXLSX();
           const wb = XLSX.read(new Uint8Array(rd.result), { type: 'array' });
           const names = wb.SheetNames; const pick = names.find(n => /試飲|イベント|今回/.test(n)) || names[0];
           const load = n => { items = rowsToProducts(XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }), $('#pp-imp').value); show(); };
