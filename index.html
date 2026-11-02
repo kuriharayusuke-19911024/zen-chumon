@@ -631,7 +631,14 @@ function bindShop() {
         const dup = DB.orders.find(o => o.clientId && o.clientId === SHOP.clientId);
         const no = dup ? dup.no : DB.orders.filter(o => o.eventId === SHOP.eventId).reduce((a, o) => Math.max(a, o.no || 0), 0) + 1;
         if (!dup) { DB.orders.push({ id: uid('o'), no, ...payload, status: 'new', checks: {}, createdAt: nowStr() }); persist(); } SHOP.no = no;
-      } else { const j = await api('submitOrder', { order: payload, token: SHOP.fromStaff ? TOKEN : undefined }); SHOP.no = j.no; }
+      } else {
+        // 混み合っているとき（同時に多くの注文が来たとき・電波が一瞬切れたとき）は、自動でもう一度送る。同じ注文は二重に登録されない
+        let j = null, lastErr = null;
+        for (let k = 0; k < 3; k++) {
+          try { j = await api('submitOrder', { order: payload, token: SHOP.fromStaff ? TOKEN : undefined }); lastErr = null; break; }
+          catch (er) { lastErr = er; const transient = !er.data || /lock|ロック|timeout|タイムアウト|service|サービス|混み/i.test(er.message || ''); if (!transient || k === 2) break; btn.textContent = '混み合っています。送り直しています…'; await new Promise(r => setTimeout(r, 1500 + Math.random() * 2500)); }
+        }
+        if (lastErr) throw lastErr; SHOP.no = j.no; }
       ssDel('zen-pending'); if (!SHOP.fromStaff) lsDel('zen-pending'); SHOP.step = 'done'; renderShop(); scrollTo(0, 0);
     } catch (e) {
       if (e.data && e.data.soldOut) { const id = e.data.soldOut; const p = prod(id); delete SHOP.cart[id]; if (p) p.active = false; SHOP.step = 'confirm'; saveDraft(true); renderShop(); scrollTo(0, 0); toast(`${e.message}。注文から外したので、内容を確かめてもう一度「この内容で注文する」を押してください`); return; }
