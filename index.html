@@ -228,11 +228,12 @@ function freeQty(l, qty) {
   const d = S().caseDeal; if (!d || !d.on || !(+d.every > 0)) return 0;
   return Math.min(qty, Math.floor(qty / +d.every) * (+d.free || 0));
 }
-// 掛け率：本数の合計で決める（インポーターをまたいで合算。追加の商品・サービスの本数も入る）
+// 掛け率：本数の合計で決める（インポーターをまたいで合算。追加の商品は入る。サービス＝無料の本数は入らない）
 function priceLines(lines) {
   const r = S().rate;
   const items = lines.map(l => ({ l, p: lineProd(l) })).filter(x => x.p && +x.l.qty > 0);
-  const kakeCount = items.filter(x => x.p.kake !== false).reduce((a, x) => a + +x.l.qty, 0);
+  // 12本に数えるのは、お金をいただく本数だけ（サービス＝無料の本数は数えない。2026/11/2 栗原さん決定）
+  const kakeCount = items.filter(x => x.p.kake !== false).reduce((a, x) => a + +x.l.qty - freeQty(x.l, +x.l.qty), 0);
   const rate = kakeCount >= +r.threshold ? +r.over : +r.under;
   const rows = [];
   items.forEach(({ l, p }) => {
@@ -934,7 +935,7 @@ function editOrder(o) {
     <div class="small" style="color:var(--warn)">内容を直すと、ダブルチェックはやり直しになります。</div>
     <label class="f" for="eo-cust">お店<select id="eo-cust"><option value="">（一覧にない：${esc(o.newName || '')}）</option>${DB.customers.map(c => `<option value="${c.id}" ${c.id === o.customerId ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></label>
     <div class="tbl"><table class="lines"><tr><th>試飲会の商品</th><th class="r">本数</th><th class="r" title="無料にする本数">うちサービス</th></tr>${groupRows(prods.map(p => ({ ...p, importerId: p.importerId })), e.importerIds).map(g => `<tr class="imp"><td colspan="3">${esc(g.i.name)}</td></tr>` + g.rows.map(p => `<tr><td>${esc(pname(p))}</td><td class="r"><input type="number" min="0" max="999" data-eq="${p.id}" id="eq-${p.id}" value="${qty[p.id] || ''}" placeholder="0" style="width:72px;text-align:right"></td><td class="r"><input type="number" min="0" max="999" data-ef="${p.id}" value="${free[p.id] ?? ''}" placeholder="${cd.on ? '自動' : '0'}" style="width:64px;text-align:right" aria-label="${esc(pname(p))}のサービス本数"></td></tr>`).join('')).join('')}</table></div>
-    <div class="tiny sub">「うちサービス」は無料にする本数です（例：12本のうち1本サービス → 本数12・サービス1）。${cd.on ? `空欄のときは設定どおり「同じ商品${cd.every}本で${cd.free}本無料」が自動で入ります。` : ''}サービスの本数も、掛け率の本数には入ります。</div>
+    <div class="tiny sub">「うちサービス」は無料にする本数です（例：12本のうち1本サービス → 本数12・サービス1。サービスの本数は「12本以上で70掛け」の本数に数えません）。${cd.on ? `空欄のときは設定どおり「同じ商品${cd.every}本で${cd.free}本無料」が自動で入ります。` : ''}サービスの本数も、掛け率の本数には入ります。</div>
     <div class="stack" style="gap:6px"><b class="small">追加の商品（試飲会に出していないもの）</b>
       <div class="tbl"><table class="lines" id="eo-xt"><tr><th>品名</th><th>インポーター</th><th>上代</th><th>価格</th><th>単価</th><th>本数</th><th>サービス</th><th>税率</th><th></th></tr>${extras.map(xRow).join('')}</table></div>
       <div><button class="btn line sm" id="eo-xadd">＋ 追加の商品を入れる</button> <span class="tiny sub">「掛け率」にすると上代に掛け率がかかり、本数は合算されます。決まった値段で売るときは「単価指定」にして単価（税抜）を入れてください。</span></div></div>
@@ -948,7 +949,7 @@ function editOrder(o) {
       readX().filter(x => x.name && x.qty > 0).forEach(x => { const l = { productId: x.productId, qty: x.qty, custom: { name: x.name, importerId: x.importerId, list: x.list, kake: x.kake, fixed: x.kake ? 0 : x.fixed, tax: x.tax } }; if (x.free !== '') l.free = x.free; lines.push(l); });
       return lines;
     };
-    const calc = () => { const pr = priceLines(build()); const fr = pr.rows.filter(r => r.free).reduce((a, r) => a + r.qty, 0); $('#eo-sum').innerHTML = `<span class="grow">合計 ${pr.count}本${fr ? `（うちサービス${fr}本）` : ''}・<b>${pr.rate}掛け</b></span><span class="num">税込 <b>${yen(pr.total)}</b></span>`; };
+    const calc = () => { const pr = priceLines(build()); const fr = pr.rows.filter(r => r.free).reduce((a, r) => a + r.qty, 0); $('#eo-sum').innerHTML = `<span class="grow">合計 ${pr.count}本${fr ? `（うちサービス${fr}本。掛け率は${pr.kakeCount}本で判定）` : ''}・<b>${pr.rate}掛け</b></span><span class="num">税込 <b>${yen(pr.total)}</b></span>`; };
     calc();
     mb.oninput = ev => { const t = ev.target; if (t.dataset.x === 'kake') { const f = t.closest('tr').querySelector('[data-x="fixed"]'); f.disabled = t.value === '1'; } calc(); };
     mb.onchange = mb.oninput;
@@ -1758,7 +1759,7 @@ function vSettings(el) {
       <label class="f" for="st-th">何本以上で<input id="st-th" type="number" value="${s.rate.threshold}"></label>
       <label class="f" for="st-un">それ未満の掛け率（%）<input id="st-un" type="number" value="${s.rate.under}"></label>
       <label class="f" for="st-ov">以上の掛け率（%）<input id="st-ov" type="number" value="${s.rate.over}"></label></div>
-      <div class="tiny sub">1回の注文で、インポーターをまたいだ合計本数で決まります（追加の商品・サービスの本数も入ります）。1円未満は切り捨てです（例：上代4,990円×70% ＝ 3,493円）。</div>
+      <div class="tiny sub">1回の注文で、インポーターをまたいだ合計本数で決まります（追加の商品の本数も入ります。サービス（無料）の本数は数えません）。1円未満は切り捨てです（例：上代4,990円×70% ＝ 3,493円）。</div>
       <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:6px"><label class="row small" style="gap:6px"><input type="checkbox" id="st-cdon" ${(s.caseDeal || {}).on ? 'checked' : ''} style="width:auto">ケース特典を自動でつける：同じ商品を</label>
         <input id="st-cdev" type="number" min="1" value="${(s.caseDeal || {}).every || 12}" style="width:64px;text-align:right" aria-label="何本ごと"><span class="small">本で</span>
         <input id="st-cdfr" type="number" min="1" value="${(s.caseDeal || {}).free || 1}" style="width:56px;text-align:right" aria-label="無料の本数"><span class="small">本無料</span></div>
